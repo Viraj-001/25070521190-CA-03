@@ -1,6 +1,6 @@
 const { MongoClient } = require('mongodb');
 
-const uri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017';
+const uri = process.env.MONGODB_URI || process.env.MONGO_URI || 'mongodb://127.0.0.1:27017';
 const databaseName = process.env.MONGODB_DB || 'keepwise';
 const client = new MongoClient(uri, { serverSelectionTimeoutMS: 5000 });
 let database = null;
@@ -13,6 +13,13 @@ async function connectDatabase() {
     await database.command({ ping: 1 });
     connectionState = 'connected';
     console.log(`MongoDB connected: ${databaseName}`);
+    try {
+      await database.collection('users').createIndex({ email: 1 }, { unique: true });
+      await database.collection('assets').createIndex({ userId: 1 });
+      await database.collection('serviceLogs').createIndex({ userId: 1 });
+    } catch (idxErr) {
+      console.warn('Index initialization notice:', idxErr.message);
+    }
   } catch (error) {
     database = null;
     connectionState = 'disconnected';
@@ -33,5 +40,6 @@ function getDatabase() {
 
 function getConnectionState() { return connectionState; }
 async function closeDatabase() { await client.close().catch(() => {}); }
+function setDatabaseForTesting(mockDb) { database = mockDb; connectionState = 'connected'; }
 
-module.exports = { connectDatabase, getDatabase, getConnectionState, closeDatabase, databaseName };
+module.exports = { connectDatabase, getDatabase, getConnectionState, closeDatabase, databaseName, setDatabaseForTesting };

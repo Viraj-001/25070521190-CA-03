@@ -2,10 +2,11 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Activity, Archive, ArrowLeft, ArrowRight, Bike, Box, CalendarClock, Check, ChevronDown,
   CircleHelp, Download, FileText, Filter, Hammer, Heart, Home, Laptop, LayoutDashboard,
-  Menu, MoreHorizontal, PackageCheck, Plus, Printer, Search, Settings2, ShieldCheck,
-  Sparkles, Tag, Trash2, TrendingUp, WashingMachine, Wrench, X, Zap
+  LogOut, Menu, MoreHorizontal, PackageCheck, Plus, Printer, Search, Settings2,
+  ShieldCheck, Sparkles, Tag, Trash2, TrendingUp, User, WashingMachine, Wrench, X, Zap
 } from 'lucide-react';
-import { api, jsonBody } from './api.js';
+import { api, jsonBody, getAuthToken, clearAuthToken, setUnauthorizedHandler } from './api.js';
+import AuthScreen from './AuthScreen.jsx';
 
 const categories = ['Technology', 'Appliances', 'Transport', 'Home', 'Other'];
 const categoryIcons = { Technology: Laptop, Appliances: WashingMachine, Transport: Bike, Home, Other: Box };
@@ -36,12 +37,14 @@ function makeCsv(rows) {
 }
 
 export default function App() {
+  const [user, setUser] = useState(null);
+  const [authChecking, setAuthChecking] = useState(true);
   const [page, setPage] = useState('overview');
   const [assets, setAssets] = useState([]);
   const [logs, setLogs] = useState([]);
   const [dbStatus, setDbStatus] = useState('checking');
   const [dbName, setDbName] = useState('keepwise');
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [search, setSearch] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('All categories');
@@ -51,24 +54,101 @@ export default function App() {
   const [toast, setToast] = useState('');
   const [mobileNav, setMobileNav] = useState(false);
 
-  const loadRecords = useCallback(async (showLoader = true) => {
-    if (showLoader) setLoading(true);
-    try {
-      const [items, serviceLogs] = await Promise.all([api('/api/assets'), api('/api/service-logs')]);
-      setAssets(items); setLogs(serviceLogs); setError('');
-    } catch (e) { setError(e.message); }
-    finally { if (showLoader) setLoading(false); }
+  const notify = useCallback((message) => {
+    setToast(message);
+    window.setTimeout(() => setToast(''), 3000);
   }, []);
 
   const checkHealth = useCallback(async () => {
     try {
       const health = await api('/api/health');
-      setDbStatus(health.database || 'disconnected'); setDbName(health.databaseName || 'keepwise');
-    } catch { setDbStatus('offline'); }
+      setDbStatus(health.database || 'disconnected');
+      setDbName(health.databaseName || 'keepwise');
+    } catch {
+      setDbStatus('offline');
+    }
   }, []);
 
-  useEffect(() => { loadRecords(); checkHealth(); const id = window.setInterval(checkHealth, 6000); return () => window.clearInterval(id); }, [loadRecords, checkHealth]);
-  useEffect(() => { if (dbStatus === 'connected') loadRecords(false); }, [dbStatus, loadRecords]);
+  const loadRecords = useCallback(async (showLoader = true) => {
+    if (!getAuthToken()) return;
+    if (showLoader) setLoading(true);
+    try {
+      const [items, serviceLogs] = await Promise.all([
+        api('/api/assets'),
+        api('/api/service-logs')
+      ]);
+      setAssets(items);
+      setLogs(serviceLogs);
+      setError('');
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      if (showLoader) setLoading(false);
+    }
+  }, []);
+
+  // Initialize session on mount
+  useEffect(() => {
+    setUnauthorizedHandler((msg) => {
+      setUser(null);
+      setAssets([]);
+      setLogs([]);
+      setError(msg || 'Your session expired. Please sign in again.');
+    });
+
+    async function initSession() {
+      const token = getAuthToken();
+      if (!token) {
+        setAuthChecking(false);
+        return;
+      }
+      try {
+        const data = await api('/api/auth/me');
+        setUser(data.user);
+      } catch {
+        clearAuthToken();
+        setUser(null);
+      } finally {
+        setAuthChecking(false);
+      }
+    }
+
+    initSession();
+    checkHealth();
+    const id = window.setInterval(checkHealth, 8000);
+    return () => window.clearInterval(id);
+  }, [checkHealth]);
+
+  // Load records whenever authenticated user changes or database connects
+  useEffect(() => {
+    if (user && dbStatus === 'connected') {
+      loadRecords(false);
+    } else if (user) {
+      loadRecords(true);
+    }
+  }, [user, dbStatus, loadRecords]);
+
+  function handleLogout() {
+    clearAuthToken();
+    setUser(null);
+    setAssets([]);
+    setLogs([]);
+    setSelectedAsset(null);
+    setModal(null);
+    notify('Signed out successfully.');
+  }
+
+  // Unified sample seed logic shared between Settings and Modal
+  async function handleSeed() {
+    try {
+      const res = await api('/api/demo/seed', { method: 'POST' });
+      await loadRecords(false);
+      if (modal?.type === 'seed') setModal(null);
+      notify(res.message || 'Sample items loaded.');
+    } catch (e) {
+      setError(e.message);
+    }
+  }
 
   const filteredAssets = useMemo(() => assets.filter(asset => {
     const q = search.trim().toLowerCase();
@@ -94,54 +174,118 @@ export default function App() {
     totalSpend: logs.reduce((sum, log) => sum + Number(log.cost || 0), 0)
   }), [assets, logs]);
 
-  const notify = (message) => { setToast(message); window.setTimeout(() => setToast(''), 2600); };
   const go = (next) => { setPage(next); setMobileNav(false); setSearch(''); setCategoryFilter('All categories'); setAssetFilter('All items'); };
 
   async function saveAsset(event) {
-    event.preventDefault(); const form = new FormData(event.currentTarget);
-    const body = Object.fromEntries(form.entries()); body.purchasePrice = Number(body.purchasePrice || 0);
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const body = Object.fromEntries(form.entries());
+    body.purchasePrice = Number(body.purchasePrice || 0);
     try {
       if (modal?.asset) await api(`/api/assets/${modal.asset._id}`, { method: 'PATCH', body: jsonBody(body) });
       else await api('/api/assets', { method: 'POST', body: jsonBody(body) });
-      setModal(null); await loadRecords(false); notify(modal?.asset ? 'Item details updated.' : 'Item added to your collection.');
+      setModal(null);
+      await loadRecords(false);
+      notify(modal?.asset ? 'Item details updated.' : 'Item added to your collection.');
     } catch (e) { setError(e.message); }
   }
 
   async function saveService(event) {
-    event.preventDefault(); const form = new FormData(event.currentTarget);
-    const body = Object.fromEntries(form.entries()); body.cost = Number(body.cost || 0);
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const body = Object.fromEntries(form.entries());
+    body.cost = Number(body.cost || 0);
     try {
       if (modal?.log) await api(`/api/service-logs/${modal.log._id}`, { method: 'PATCH', body: jsonBody(body) });
       else await api('/api/service-logs', { method: 'POST', body: jsonBody(body) });
-      setModal(null); await loadRecords(false); notify(modal?.log ? 'Service record updated.' : 'Service visit added to your timeline.');
+      setModal(null);
+      await loadRecords(false);
+      notify(modal?.log ? 'Service record updated.' : 'Service visit added to your timeline.');
     } catch (e) { setError(e.message); }
   }
 
   async function deleteAsset(asset) {
     if (!window.confirm(`Delete ${asset.name} and its service history?`)) return;
-    try { await api(`/api/assets/${asset._id}`, { method: 'DELETE' }); setSelectedAsset(null); await loadRecords(false); notify('Item and its service history deleted.'); }
-    catch (e) { setError(e.message); }
+    try {
+      await api(`/api/assets/${asset._id}`, { method: 'DELETE' });
+      setSelectedAsset(null);
+      await loadRecords(false);
+      notify('Item and its service history deleted.');
+    } catch (e) { setError(e.message); }
   }
+
   async function deleteLog(log) {
     if (!window.confirm(`Delete the service record “${log.title}”?`)) return;
-    try { await api(`/api/service-logs/${log._id}`, { method: 'DELETE' }); await loadRecords(false); notify('Service record deleted.'); }
-    catch (e) { setError(e.message); }
+    try {
+      await api(`/api/service-logs/${log._id}`, { method: 'DELETE' });
+      await loadRecords(false);
+      notify('Service record deleted.');
+    } catch (e) { setError(e.message); }
   }
+
   async function archiveAsset(asset) {
-    try { await api(`/api/assets/${asset._id}`, { method: 'PATCH', body: jsonBody({ status: asset.status === 'Archived' ? 'Active' : 'Archived' }) }); setSelectedAsset(null); await loadRecords(false); notify(asset.status === 'Archived' ? 'Item restored.' : 'Item archived.'); }
-    catch (e) { setError(e.message); }
+    try {
+      await api(`/api/assets/${asset._id}`, { method: 'PATCH', body: jsonBody({ status: asset.status === 'Archived' ? 'Active' : 'Archived' }) });
+      setSelectedAsset(null);
+      await loadRecords(false);
+      notify(asset.status === 'Archived' ? 'Item restored.' : 'Item archived.');
+    } catch (e) { setError(e.message); }
   }
+
   function exportAssets() {
-    const rows = [['Name', 'Category', 'Brand', 'Model', 'Purchase date', 'Warranty end', 'Purchase price', 'Next service', 'Status'], ...assets.map(a => [a.name, a.category, a.brand, a.model, a.purchaseDate, a.warrantyEnd, a.purchasePrice, a.nextServiceDate, a.status])];
-    const link = document.createElement('a'); link.href = URL.createObjectURL(new Blob([makeCsv(rows)], { type: 'text/csv;charset=utf-8' })); link.download = 'keepwise-inventory.csv'; link.click(); setTimeout(() => URL.revokeObjectURL(link.href), 1000); notify('Inventory exported as CSV.');
+    const rows = [
+      ['Name', 'Category', 'Brand', 'Model', 'Purchase date', 'Warranty end', 'Purchase price', 'Next service', 'Status'],
+      ...assets.map(a => [a.name, a.category, a.brand, a.model, a.purchaseDate, a.warrantyEnd, a.purchasePrice, a.nextServiceDate, a.status])
+    ];
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(new Blob([makeCsv(rows)], { type: 'text/csv;charset=utf-8' }));
+    link.download = 'keepwise-inventory.csv';
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+    notify('Inventory exported as CSV.');
   }
-  function openService(asset = null, log = null) { setModal({ type: 'service', asset: asset || assets.find(a => a._id === log?.assetId), log }); }
+
+  function openService(asset = null, log = null) {
+    setModal({ type: 'service', asset: asset || assets.find(a => a._id === log?.assetId), log });
+  }
+
+  if (authChecking) {
+    return (
+      <div className="auth-wrapper">
+        <div className="auth-card" style={{ textAlign: 'center', padding: '40px 20px' }}>
+          <div className="brand-mark" style={{ margin: '0 auto 16px' }}><PackageCheck size={22} /></div>
+          <strong style={{ display: 'block', fontSize: '13px', color: '#33483b' }}>Starting Keepwise...</strong>
+          <span style={{ fontSize: '9px', color: '#88958c', marginTop: '6px', display: 'block' }}>Verifying your secure session</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return (
+      <AuthScreen
+        dbStatus={dbStatus}
+        onSuccess={(newUser) => {
+          setUser(newUser);
+          notify(`Welcome to Keepwise, ${newUser.name}!`);
+        }}
+        initialError={error}
+        clearInitialError={() => setError('')}
+      />
+    );
+  }
 
   const pageTitles = { overview: 'Overview', assets: 'My items', service: 'Service history', settings: 'Settings' };
+  const userInitial = (user.name || 'K').trim().charAt(0).toUpperCase();
+
   return (
     <div className="app-shell">
       <aside className={`sidebar ${mobileNav ? 'sidebar-open' : ''}`}>
-        <div className="brand-row"><div className="brand-mark"><PackageCheck size={19} /></div><span className="brand-word">keepwise</span><span className="brand-dot">.</span></div>
+        <div className="brand-row">
+          <div className="brand-mark"><PackageCheck size={19} /></div>
+          <span className="brand-word">keepwise</span>
+          <span className="brand-dot">.</span>
+        </div>
         <div className="workspace-label">YOUR HOUSEHOLD</div>
         <nav className="side-nav" aria-label="Main navigation">
           <NavButton icon={LayoutDashboard} label="Overview" active={page === 'overview'} onClick={() => go('overview')} />
@@ -149,35 +293,128 @@ export default function App() {
           <NavButton icon={Wrench} label="Service history" active={page === 'service'} onClick={() => go('service')} />
         </nav>
         <div className="sidebar-bottom">
-          <div className="side-tip"><div className="tip-icon"><Sparkles size={15} /></div><strong>A little care goes a long way</strong><p>Keep receipts, service notes, and important dates in one place.</p><button onClick={() => go('assets')}>Explore your items <ArrowRight size={13} /></button></div>
+          <div className="side-tip">
+            <div className="tip-icon"><Sparkles size={15} /></div>
+            <strong>A little care goes a long way</strong>
+            <p>Keep receipts, service notes, and important dates in one place.</p>
+            <button onClick={() => go('assets')}>Explore your items <ArrowRight size={13} /></button>
+          </div>
           <NavButton icon={Settings2} label="Settings" active={page === 'settings'} onClick={() => go('settings')} />
-          <div className="profile-row"><div className="profile-avatar">K</div><div><strong>My household</strong><span>Personal space</span></div><button className="icon-only" aria-label="Account options"><MoreHorizontal size={18} /></button></div>
+          <div className="profile-row">
+            <div className="profile-avatar">{userInitial}</div>
+            <div style={{ minWidth: 0, overflow: 'hidden' }}>
+              <strong style={{ display: 'block', textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap' }}>{user.name}</strong>
+              <span style={{ display: 'block', textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap', fontSize: '9px', color: '#95a098' }}>{user.email}</span>
+            </div>
+            <button className="icon-only danger-hover" onClick={handleLogout} title="Sign out of Keepwise" aria-label="Sign out">
+              <LogOut size={16} />
+            </button>
+          </div>
         </div>
       </aside>
 
       <main className="main-area">
         <header className="topbar">
           <button className="mobile-menu" onClick={() => setMobileNav(v => !v)} aria-label="Toggle menu"><Menu size={19} /></button>
-          <div className="breadcrumbs"><span>Keepwise</span><span className="crumb-slash">/</span><strong>{pageTitles[page]}</strong></div>
+          <div className="breadcrumbs">
+            <span>Keepwise</span>
+            <span className="crumb-slash">/</span>
+            <strong>{pageTitles[page]}</strong>
+          </div>
           <div className="topbar-actions">
-            <div className={`db-pill ${dbStatus === 'connected' ? 'db-good' : ''}`}><i />{dbStatus === 'connected' ? 'MongoDB connected' : dbStatus === 'offline' ? 'API offline' : 'Connecting database'}</div>
+            <div className={`db-pill ${dbStatus === 'connected' ? 'db-good' : ''}`}>
+              <i />
+              {dbStatus === 'connected' ? 'MongoDB connected' : dbStatus === 'offline' ? 'API offline' : 'Connecting database'}
+            </div>
             <button className="top-icon" title="Help" onClick={() => setModal({ type: 'help' })}><CircleHelp size={17} /></button>
-            <div className="top-avatar">K</div>
+            <div className="top-avatar" title={`Signed in as ${user.name}`}>{userInitial}</div>
           </div>
         </header>
 
-        {error && <div className="error-banner"><span><Zap size={15} /> {error}</span><button onClick={() => { setError(''); loadRecords(); checkHealth(); }}>Try again <ArrowRight size={13} /></button><button aria-label="Dismiss" className="error-close" onClick={() => setError('')}><X size={15} /></button></div>}
+        {error && (
+          <div className="error-banner">
+            <span><Zap size={15} /> {error}</span>
+            <button onClick={() => { setError(''); loadRecords(); checkHealth(); }}>Try again <ArrowRight size={13} /></button>
+            <button aria-label="Dismiss" className="error-close" onClick={() => setError('')}><X size={15} /></button>
+          </div>
+        )}
 
-        {page === 'overview' && <Overview assets={assets} logs={logs} upcoming={upcoming} stats={stats} loading={loading} onAdd={() => setModal({ type: 'asset' })} onOpen={setSelectedAsset} onPage={go} onAddService={openService} />}
-        {page === 'assets' && <AssetsPage assets={filteredAssets} search={search} setSearch={setSearch} categoryFilter={categoryFilter} setCategoryFilter={setCategoryFilter} assetFilter={assetFilter} setAssetFilter={setAssetFilter} onAdd={() => setModal({ type: 'asset' })} onOpen={setSelectedAsset} onExport={exportAssets} />}
-        {page === 'service' && <ServicePage logs={logs} assets={assets} onAdd={() => openService()} onEdit={(log) => openService(null, log)} onDelete={deleteLog} />}
-        {page === 'settings' && <SettingsPage dbName={dbName} onExport={exportAssets} onSeed={async () => { try { await api('/api/demo/seed', { method: 'POST' }); await loadRecords(false); notify('Sample items loaded.'); } catch (e) { setError(e.message); } }} />}
+        {page === 'overview' && (
+          <Overview
+            assets={assets}
+            logs={logs}
+            upcoming={upcoming}
+            stats={stats}
+            loading={loading}
+            onAdd={() => setModal({ type: 'asset' })}
+            onOpen={setSelectedAsset}
+            onPage={go}
+            onAddService={openService}
+          />
+        )}
+        {page === 'assets' && (
+          <AssetsPage
+            assets={filteredAssets}
+            search={search}
+            setSearch={setSearch}
+            categoryFilter={categoryFilter}
+            setCategoryFilter={setCategoryFilter}
+            assetFilter={assetFilter}
+            setAssetFilter={setAssetFilter}
+            onAdd={() => setModal({ type: 'asset' })}
+            onOpen={setSelectedAsset}
+            onExport={exportAssets}
+          />
+        )}
+        {page === 'service' && (
+          <ServicePage
+            logs={logs}
+            assets={assets}
+            onAdd={() => openService()}
+            onEdit={(log) => openService(null, log)}
+            onDelete={deleteLog}
+          />
+        )}
+        {page === 'settings' && (
+          <SettingsPage
+            user={user}
+            dbName={dbName}
+            onExport={exportAssets}
+            onLogout={handleLogout}
+            onSeed={handleSeed}
+          />
+        )}
 
-        <footer className="app-footer"><span>Keepwise <span className="footer-dot">·</span> Care for what you own.</span><span><ShieldCheck size={13} /> Your household data stays in your MongoDB</span></footer>
+        <footer className="app-footer">
+          <span>Keepwise <span className="footer-dot">·</span> Care for what you own.</span>
+          <span><ShieldCheck size={13} /> Your household data is protected with JWT & MongoDB</span>
+        </footer>
       </main>
 
-      {selectedAsset && <AssetDrawer asset={assets.find(a => a._id === selectedAsset._id) || selectedAsset} logs={logs.filter(log => log.assetId === selectedAsset._id)} onClose={() => setSelectedAsset(null)} onEdit={() => { setModal({ type: 'asset', asset: selectedAsset }); setSelectedAsset(null); }} onDelete={() => deleteAsset(selectedAsset)} onArchive={() => archiveAsset(selectedAsset)} onAddService={() => openService(selectedAsset)} onEditLog={(log) => { setSelectedAsset(null); openService(null, log); }} />}
-      {modal && <Modal modal={modal} assets={assets} onClose={() => setModal(null)} onSaveAsset={saveAsset} onSaveService={saveService} onSeed={async () => { try { await api('/api/demo/seed', { method: 'POST' }); await loadRecords(false); setModal(null); notify('Sample items loaded.'); } catch (e) { setError(e.message); } }} />}
+      {selectedAsset && (
+        <AssetDrawer
+          asset={assets.find(a => a._id === selectedAsset._id) || selectedAsset}
+          logs={logs.filter(log => log.assetId === selectedAsset._id)}
+          onClose={() => setSelectedAsset(null)}
+          onEdit={() => { setModal({ type: 'asset', asset: selectedAsset }); setSelectedAsset(null); }}
+          onDelete={() => deleteAsset(selectedAsset)}
+          onArchive={() => archiveAsset(selectedAsset)}
+          onAddService={() => openService(selectedAsset)}
+          onEditLog={(log) => { setSelectedAsset(null); openService(null, log); }}
+        />
+      )}
+
+      {modal && (
+        <Modal
+          modal={modal}
+          assets={assets}
+          onClose={() => setModal(null)}
+          onSaveAsset={saveAsset}
+          onSaveService={saveService}
+          onSeed={handleSeed}
+        />
+      )}
+
       <div className={`toast ${toast ? 'toast-show' : ''}`} role="status">{toast}</div>
     </div>
   );
@@ -258,11 +495,57 @@ function ServicePage({ logs, assets, onAdd, onEdit, onDelete }) {
   </section>;
 }
 
-function SettingsPage({ dbName, onExport, onSeed }) {
-  return <section className="page-content"><PageHeading eyebrow="YOUR KEEPWISE SPACE" title="Settings" description="Manage your local demo data and see where it is stored." />
-    <div className="settings-layout"><section className="surface settings-card"><div className="settings-heading"><div className="settings-symbol"><DatabaseSymbol/></div><div><h2>MongoDB connection</h2><p>Keepwise saves item and service records in your connected database.</p></div><span className="settings-live"><i/> LIVE STATUS</span></div><div className="settings-detail"><span>Database name</span><code>{dbName}</code></div><div className="settings-detail"><span>Collections</span><code>assets · serviceLogs</code></div><div className="settings-help"><CircleHelp size={15}/><p>Connect MongoDB Compass to the same URI in <code>server/.env</code> to inspect these collections as you use the app.</p></div></section>
-      <section className="surface settings-card"><div className="settings-heading"><div className="settings-symbol warm"><FileText size={17}/></div><div><h2>Your data, your copy</h2><p>Export an inventory snapshot or load safe demo records.</p></div></div><div className="settings-actions"><button className="btn btn-secondary" onClick={onExport}><Download size={15}/> Export inventory CSV</button><button className="btn btn-secondary" onClick={onSeed}><Sparkles size={15}/> Load sample records</button></div><p className="settings-caption">Sample data is only added when the inventory is empty, so existing records are kept safe.</p></section></div>
-    <div className="privacy-note"><ShieldCheck size={16}/><div><strong>Built for a single-household demo</strong><p>Keepwise is a course project prototype. Don’t store passwords, payment details, or highly sensitive documents in this demo database.</p></div></div>
+function SettingsPage({ user, dbName, onExport, onSeed, onLogout }) {
+  return <section className="page-content">
+    <PageHeading eyebrow="YOUR KEEPWISE SPACE" title="Settings" description="Manage your account, database connection, and demo data." />
+    <div className="settings-layout">
+      <section className="surface settings-card">
+        <div className="settings-heading">
+          <div className="settings-symbol"><User size={17}/></div>
+          <div><h2>Household account</h2><p>Signed in with JWT-secured authentication.</p></div>
+        </div>
+        <div className="settings-detail"><span>Name</span><strong>{user?.name}</strong></div>
+        <div className="settings-detail"><span>Email</span><code>{user?.email}</code></div>
+        <div className="settings-detail"><span>Data isolation</span><code>Active (User-Scoped)</code></div>
+        <div style={{ marginTop: '14px' }}>
+          <button className="profile-action-btn" onClick={onLogout}><LogOut size={13}/> Sign out of Keepwise</button>
+        </div>
+      </section>
+
+      <section className="surface settings-card">
+        <div className="settings-heading">
+          <div className="settings-symbol"><DatabaseSymbol/></div>
+          <div><h2>MongoDB connection</h2><p>Keepwise saves item and service records in your connected database.</p></div>
+          <span className="settings-live"><i/> LIVE STATUS</span>
+        </div>
+        <div className="settings-detail"><span>Database name</span><code>{dbName}</code></div>
+        <div className="settings-detail"><span>Collections</span><code>users · assets · serviceLogs</code></div>
+        <div className="settings-help">
+          <CircleHelp size={15}/>
+          <p>Connect MongoDB Compass to the URI configured in <code>Server/.env</code> to inspect your data.</p>
+        </div>
+      </section>
+
+      <section className="surface settings-card" style={{ gridColumn: '1 / -1' }}>
+        <div className="settings-heading">
+          <div className="settings-symbol warm"><FileText size={17}/></div>
+          <div><h2>Your data, your copy</h2><p>Export an inventory snapshot or load safe demo records for this account.</p></div>
+        </div>
+        <div className="settings-actions">
+          <button className="btn btn-secondary" onClick={onExport}><Download size={15}/> Export inventory CSV</button>
+          <button className="btn btn-secondary" onClick={onSeed}><Sparkles size={15}/> Load sample records</button>
+        </div>
+        <p className="settings-caption">Sample data is only added when your inventory is empty, so existing records are kept safe.</p>
+      </section>
+    </div>
+
+    <div className="privacy-note">
+      <ShieldCheck size={16}/>
+      <div>
+        <strong>Protected Household Space</strong>
+        <p>Your inventory items and service timeline are private to this account. All requests are authenticated with JSON Web Tokens (JWT) and passwords are saved as secure bcrypt hashes.</p>
+      </div>
+    </div>
   </section>;
 }
 function DatabaseSymbol() { return <span className="database-symbol">▤</span>; }
